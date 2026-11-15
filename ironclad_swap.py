@@ -11,8 +11,8 @@ import util
 #
 # Hammer swings are made in a Frenzied Berserker and mid-air boosts in
 # Boosters, while you keep your normal armor and Stompers on. Each item is
-# worn only inside the one game call that reads it, so nothing ever shows as
-# equipped, not even for a frame.
+# worn through the native action message, then restored in the same call
+# stack. Restoring inside doUse would send MOVE/MOVE before the action.
 #
 # Measured in the Steam Windows client (the same build volta6 targets):
 # - Hammer::doUse is where a swing works out its damage: it calls
@@ -45,6 +45,11 @@ GET_ITEM = 0x41bd00
 GET_ITEM_SIG = bytes.fromhex('5581c18402000089e5508d4508890424')
 TERRAIN = 0x443280  # NativeObject::attachedTerrainType, 0 = mid-air
 TERRAIN_SIG = bytes.fromhex('5589e583ec08e865ffffff')
+SEND_MESSAGE = 0x472b30  # ServerConnection::sendMessage(type, MessageLite const&)
+# Complete position-independent instructions, checked in the Windows binary.
+SEND_MESSAGE_SIG = bytes.fromhex('5589e55381ec94000000')
+MT_PLAYER_INPUT = 14
+MT_TIME_PASSES = 15
 USE_INDEX = 5  # vtable index of Item::doUse
 CAN_ACT_INDEX = 41  # vtable index of canDoAction (PlayerCharacter::canDoAction)
 
@@ -74,6 +79,12 @@ CALL_THUNK = bytes.fromhex(
     'ffd0'      # call eax
     '89ec5dc3'  # mov esp, ebp; pop ebp; ret
 )
+SEND_CALL_THUNK = bytes.fromhex(
+    '5589e5' '83e4f0' '83ec08'  # frame; align; reserve 8 bytes
+    '8b4d08' '8b450c'          # ecx=this, eax=function
+    'ff7514' 'ff7510' 'ffd0'  # push message, type; native thiscall (ret 8)
+    '89ec5dc3'
+)
 
 
 def entry_thunk(cb_cell, orig_cell):
@@ -91,12 +102,25 @@ def entry_thunk(cb_cell, orig_cell):
 
 THUNK_MAGIC = b'IRNS'
 CALL_AT = 0x80  # CALL_THUNK's offset in the page
+SEND_AT = 0x100
+SEND_CALL_AT = 0x140
+SEND_ORIGINAL_AT = 0x180
 HOOKS = (('hammer', HAMMER_SLOT, HAMMER_DOUSE), ('plain', ITEM_SLOT, ITEM_DOUSE))
+
+
+def jump_to(source, target):
+    return b'\xe9' + ((target - source - 5) & 0xffffffff).to_bytes(4, 'little')
+
+
+def sender_patch(page):
+    return jump_to(SEND_MESSAGE, page + SEND_AT) + b'\x90' * (len(SEND_MESSAGE_SIG) - 5)
 
 kffi = cffi.FFI()
 kffi.cdef('''
 typedef uint32_t (__stdcall *iron_hook)(uint32_t self, uint32_t use);
 typedef uint32_t (*iron_call)(uint32_t self, uint32_t fn, uint32_t arg);
+typedef void (__stdcall *iron_send_hook)(uint32_t self, uint32_t type, uint32_t message);
+typedef void (*iron_send_call)(uint32_t self, uint32_t fn, uint32_t type, uint32_t message);
 void *__stdcall VirtualAlloc(void *addr, size_t size, uint32_t type, uint32_t protect);
 int __stdcall VirtualProtect(void *addr, size_t size, uint32_t protect, uint32_t *old);
 void *__stdcall GetCurrentProcess(void);
@@ -112,6 +136,7 @@ class Native(object):
         self.plugin = plugin
         self.k32 = kffi.dlopen('kernel32.dll')
         self.call = None
+        self.send_call = None
         self.vtable = 0
         self.mine = {}  # cb cell -> this instance's callback
 
@@ -135,6 +160,12 @@ class Native(object):
     def world_client(self):
         wc = self.plugin.refs.WorldClient
         return 0 if wc == ffi.NULL else int(ffi.cast('uintptr_t', wc))
+
+    def identity(self):
+        wc = self.world_client()
+        cw = self.plugin.refs.ClientWorld
+        return (wc, 0 if cw == ffi.NULL else int(ffi.cast('uintptr_t', cw)),
+                self.u32(wc + 0x3c) if wc else 0)
 
     def buffer(self):
         cw = self.plugin.refs.ClientWorld
@@ -193,6 +224,44 @@ class Native(object):
     def item_use_fn(self, item):
         return self.u32(self.u32(item) + USE_INDEX * 4)
 
+    def send(self, connection, kind, message):
+        self.send_call(connection, self.send_original, kind, message)
+
+    def install_sender(self, state, callback):
+        page = state['page']
+        current = self.read(SEND_MESSAGE, len(SEND_MESSAGE_SIG))
+        patch = sender_patch(page)
+        if current not in (SEND_MESSAGE_SIG, patch):
+            return 'unknown client build or another plugin owns the native sender'
+        at = page + SEND_AT
+        cell = at + 0x20
+        if not state.get('sender'):
+            if current != SEND_MESSAGE_SIG:
+                return 'sender trampoline state is missing'
+            original = page + SEND_ORIGINAL_AT
+            trampoline = SEND_MESSAGE_SIG + jump_to(original + len(SEND_MESSAGE_SIG), SEND_MESSAGE + len(SEND_MESSAGE_SIG))
+            for address, code in ((at, entry_thunk(cell, at + 0x24)),
+                                  (page + SEND_CALL_AT, SEND_CALL_THUNK), (original, trampoline)):
+                kffi.memmove(kffi.cast('void *', address), code, len(code))
+            kffi.cast('uint32_t *', cell)[0] = 0
+            kffi.cast('uint32_t *', at + 0x24)[0] = original
+            self.k32.FlushInstructionCache(self.k32.GetCurrentProcess(), kffi.cast('void *', page), 4096)
+            state['sender'] = original
+        self.send_original = state['sender']
+        self.send_call = kffi.cast('iron_send_call', page + SEND_CALL_AT)
+        cb = kffi.callback('iron_send_hook', callback)
+        state['keep'].append(cb)
+        self.mine[cell] = int(kffi.cast('uintptr_t', cb))
+        kffi.cast('uint32_t *', cell)[0] = self.mine[cell]
+        if current != patch:
+            old = kffi.new('uint32_t *')
+            if not self.k32.VirtualProtect(kffi.cast('void *', SEND_MESSAGE), len(patch), 0x40, old):
+                return 'VirtualProtect failed for native sender'
+            kffi.memmove(kffi.cast('void *', SEND_MESSAGE), patch, len(patch))
+            self.k32.FlushInstructionCache(self.k32.GetCurrentProcess(), kffi.cast('void *', SEND_MESSAGE), len(patch))
+            self.k32.VirtualProtect(kffi.cast('void *', SEND_MESSAGE), len(patch), old[0], old)
+        return None
+
     def install(self, callbacks):
         '''Point the two vtable entries at entry thunks that call `callbacks`.
         The thunk page lives in sys so a reloaded plugin reuses it.'''
@@ -224,6 +293,13 @@ class Native(object):
             setattr(sys, '_sbpe_ironclad_swap', state)
         page = state['page']
         self.call = kffi.cast('iron_call', page + CALL_AT)
+        # Validate both item slots before changing any callback or native code.
+        for i, (name, slot, orig) in enumerate(HOOKS):
+            if self.u32(slot) not in (orig, page + 0x40 * i):
+                return '%s vtable entry is owned by another plugin' % name
+        error = self.install_sender(state, callbacks['sent'])
+        if error:
+            return error
         for i, (name, slot, orig) in enumerate(HOOKS):
             at = page + 0x40 * i
             current = self.u32(slot)
@@ -260,6 +336,7 @@ class Swapper(object):
         self.log = log
         self.busy = False
         self.pending = None
+        self.deferred = []
         self.swings = self.boosts = self.skipped_buffer = 0
         self.said = set()
 
@@ -280,7 +357,7 @@ class Swapper(object):
         info = self.n.item(item)
         if info['user'] != pc or info['slot_pos'] != slot or not self.n.can_act(pc):
             return None
-        need = 2 * INPUT_COST + max(self.config.buffer_reserve, 0)
+        need = (2 + len(self.deferred)) * INPUT_COST + max(self.config.buffer_reserve, 0)
         if self.n.buffer() < need:
             self.skipped_buffer += 1
             self.once('buffer', 'ironclad_swap: input buffer below %d; skipping swaps until it refills' % need)
@@ -310,11 +387,53 @@ class Swapper(object):
 
     def swap_out(self, pc, worn_slot, bag_slot, worn, swap):
         self.n.move(bag_slot, worn_slot)
-        if self.n.get_item(pc, worn_slot) == worn:
+        if self.n.get_item(pc, worn_slot) == worn and self.n.get_item(pc, bag_slot) == swap:
             return True
-        self.pending = (pc, worn_slot, bag_slot, worn, swap)
+        if self.pending is None:
+            self.pending = []
+        self.pending.append((self.n.identity(), (pc, worn_slot, bag_slot, worn, swap)))
         self.log('ironclad_swap: putting the worn item back was refused; retrying each frame')
         return False
+
+    def defer_restore(self, pc, worn_slot, bag_slot, worn, swap):
+        self.deferred.append((self.n.identity(), (pc, worn_slot, bag_slot, worn, swap)))
+
+    def sent(self, connection, kind):
+        # Never restore on an ack, damage report or our recursive MOVE sends.
+        if kind not in (MT_PLAYER_INPUT, MT_TIME_PASSES) or not self.deferred:
+            return
+        identity = self.n.identity()
+        if connection != identity[2]:
+            return
+        plans, self.deferred = self.deferred, []
+        for saved, plan in reversed(plans):
+            self.restore_checked(saved, plan, 'after native action message')
+
+    def restore_checked(self, identity, plan, reason):
+        try:
+            self.restore(identity, plan, reason)
+        except Exception:
+            if self.pending is None:
+                self.pending = []
+            self.pending.append((identity, plan))
+            self.once('restore-error', 'ironclad_swap: restore raised an error; retaining the exact pair for retry')
+
+    def restore(self, identity, plan, reason):
+        pc, worn_slot, bag_slot, worn, swap = plan
+        if self.n.identity() != identity or self.n.player() != pc:
+            return
+        pair = self.n.get_item(pc, worn_slot), self.n.get_item(pc, bag_slot)
+        if pair == (worn, swap):
+            return
+        if pair != (swap, worn):
+            return  # User changed gear; do not toggle unrelated items.
+        if self.n.buffer() < INPUT_COST:
+            if self.pending is None:
+                self.pending = []
+            self.pending.append((identity, plan))
+            return
+        if self.swap_out(*plan):
+            self.once('restored-' + reason, 'ironclad_swap: worn gear restored ' + reason)
 
     def on_hammer(self, item, use, original):
         plan = None
@@ -340,19 +459,20 @@ class Swapper(object):
         try:
             if not self.swap_in(pc, worn_slot, bag_slot, worn, swap):
                 return original(item, use)
-            during = self.n.bonuses(pc)
+            during = normal
             try:
+                during = self.n.bonuses(pc)
                 return original(item, use)
             finally:
-                back = self.swap_out(pc, worn_slot, bag_slot, worn, swap)
+                self.defer_restore(pc, worn_slot, bag_slot, worn, swap)
                 self.swings += 1
                 if self.swings == 1 or self.swings % 25 == 0:
                     boots = self.n.get_item(pc, SLOT_MOB)
                     self.log('ironclad_swap: swing #%d made in the Frenzied Berserker with %s on: damage bonus %d '
-                             '(normally %d), crit chance %d (normally %d), crit damage %d (normally %d); %s back on. '
+                             '(normally %d), crit chance %d (normally %d), crit damage %d (normally %d); %s restoration queued after native action. '
                              'Skipped for low buffer: %d'
                              % (self.swings, self.n.item(boots)['name'] if boots else 'no boots', during[0], normal[0],
-                                during[1], normal[1], during[2], normal[2], armor if back else 'armor NOT',
+                                during[1], normal[1], during[2], normal[2], armor,
                                 self.skipped_buffer))
         finally:
             self.busy = False
@@ -380,28 +500,22 @@ class Swapper(object):
                 # the Boosters' own doUse (Booster::doUse) makes the boost
                 return self.n.use(self.n.item_use_fn(swap), swap, use)
             finally:
-                back = self.swap_out(pc, worn_slot, bag_slot, worn, swap)
+                self.defer_restore(pc, worn_slot, bag_slot, worn, swap)
                 self.boosts += 1
                 if self.boosts == 1 or self.boosts % 25 == 0:
-                    self.log('ironclad_swap: boost #%d started in the Boosters; %s back on'
-                             % (self.boosts, boots if back else 'boots NOT'))
+                    self.log('ironclad_swap: boost #%d started in the Boosters; %s restoration queued after native action'
+                             % (self.boosts, boots))
         finally:
             self.busy = False
 
     def frame(self):
-        '''retry a refused swap-back; give up if anything changed meanwhile'''
-        if not self.pending:
-            return
-        pc, worn_slot, bag_slot, worn, swap = self.pending
-        if self.n.player() != pc or self.n.get_item(pc, worn_slot) != swap or self.n.get_item(pc, bag_slot) != worn:
-            self.pending = None
-            return
-        if self.n.buffer() < INPUT_COST:
-            return
-        self.n.move(bag_slot, worn_slot)
-        if self.n.get_item(pc, worn_slot) == worn:
-            self.pending = None
-            self.log('ironclad_swap: worn item restored')
+        '''Fallback if no native action was emitted; retry refused restores.'''
+        deferred, self.deferred = self.deferred, []
+        pending, self.pending = self.pending or [], None
+        for identity, plan in reversed(deferred):
+            self.restore_checked(identity, plan, 'at frame fallback (action order unverified)')
+        for identity, plan in pending:
+            self.restore_checked(identity, plan, 'on retry')
 
 
 class Plugin(PluginBase):
@@ -417,8 +531,9 @@ class Plugin(PluginBase):
         self.native = Native(self)
         self.swapper = Swapper(self.native, self.config, logging.info)
         self.active = False
-        error = self.native.install({'hammer': self.hammer_hook, 'plain': self.plain_hook})
+        error = self.native.install({'hammer': self.hammer_hook, 'plain': self.plain_hook, 'sent': self.sent_hook})
         if error:
+            self.native.release()
             logging.error('ironclad_swap: off, %s', error)
             return
         self.active = True
@@ -447,6 +562,15 @@ class Plugin(PluginBase):
     def plain_hook(self, this, use):
         return self._hook(self.swapper.on_plain, ITEM_DOUSE, this, use)
 
+    def sent_hook(self, connection, kind, message):
+        # Forward the original message exactly once before any restoration.
+        self.native.send(connection, kind, message)
+        if self.active:
+            try:
+                self.swapper.sent(connection, kind)
+            except Exception:
+                logging.exception('ironclad_swap: sender restore error; retrying on next frame')
+
     def beforeUpdate(self):
         if self.active:
             try:
@@ -457,4 +581,9 @@ class Plugin(PluginBase):
     def __del__(self):
         # calls go straight to the game again until a reloaded copy takes over
         if getattr(self, 'active', False):
+            # Resolve queued moves while the sender still belongs to us.
+            try:
+                self.swapper.frame()
+            except Exception:
+                logging.exception('ironclad_swap: unload restoration failed')
             self.native.release()

@@ -41,6 +41,9 @@ class Game(object):
         self.terrain = 0
         self.refuse = 0
         self.moves = 0
+        self.events = []
+        self.world = 0x3000
+        self.connection = 0x4000
         self.items = {}
         self.slots = {}
         self.calls = []
@@ -78,6 +81,9 @@ class Game(object):
     def buffer(self):
         return self.buffer_
 
+    def identity(self):
+        return (0x2000, self.world, self.connection)
+
     def can_act(self, pc):
         return self.acting
 
@@ -99,6 +105,10 @@ class Game(object):
             self.slots[to] = a
         if b:
             self.slots[frm] = b
+        self.events.append(18)
+
+    def send(self, connection, kind, message=None):
+        self.events.append(kind)
 
     def bonuses(self, pc):
         damage, crit, crit_damage = 0, 75, 150
@@ -145,12 +155,23 @@ def setup(**config):
     return g, s, logs
 
 
-def swing(g, s):
-    return s.on_hammer(HAMMER, 1, lambda item, u: g.use(iron.HAMMER_DOUSE, item, u))
+def native_action(g, s, kind=iron.MT_PLAYER_INPUT):
+    g.send(g.connection, kind)
+    s.sent(g.connection, kind)
 
 
-def jump(g, s, item=STOMPERS, use=iron.AIR_USE):
-    return s.on_plain(item, use, lambda it, u: g.use(iron.ITEM_DOUSE, it, u))
+def swing(g, s, send=True):
+    result = s.on_hammer(HAMMER, 1, lambda item, u: g.use(iron.HAMMER_DOUSE, item, u))
+    if send:
+        native_action(g, s)
+    return result
+
+
+def jump(g, s, item=STOMPERS, use=iron.AIR_USE, send=True):
+    result = s.on_plain(item, use, lambda it, u: g.use(iron.ITEM_DOUSE, it, u))
+    if send:
+        native_action(g, s)
+    return result
 
 
 def start_state(g):
@@ -221,7 +242,7 @@ def main():
     assert swing(g, s) == 0x1234 and g.moves == moves  # no new swaps while pending
     g.buffer_ = 50; s.frame(); assert g.slots[iron.SLOT_BODY] == BERSERKER and s.pending
     g.buffer_ = 80; s.frame(); assert g.slots[iron.SLOT_BODY] == PLATING and g.slots[iron.SLOT_INV + 2] == BERSERKER
-    assert not s.pending and any('worn item restored' in m for m in logs)
+    assert not s.pending and any('worn gear restored on retry' in m for m in logs)
     # The retry gives up if the items changed meanwhile.
     g, s, _ = setup()
     real_move = g.move
@@ -237,7 +258,7 @@ def main():
     assert g.calls == [('boost', BOOSTERS, iron.AIR_USE)], g.calls
     assert start_state(g) == (PLATING, STOMPERS, BERSERKER, BOOSTERS) and g.moves == 2 and g.buffer_ == 850
     assert g.slots[iron.SLOT_INV + 4] == GLIDERS  # Gliders don't match "Boosters"
-    assert any('boost #1 started in the Boosters; Spiked Stompers back on' in m for m in logs), logs
+    assert any('boost #1 started in the Boosters; Spiked Stompers restoration queued after native action' in m for m in logs), logs
     # On the ground, other uses, other slots, other players, can't act, low buffer, option off: untouched.
     for change in (lambda g: setattr(g, 'terrain', 1), lambda g: setattr(g, 'acting', False),
                    lambda g: setattr(g, 'buffer_', 200), lambda g: g.items[STOMPERS].update(user=0x2000),
@@ -257,6 +278,51 @@ def main():
     # A swing and a boost in a row leave everything where it started.
     g, s, _ = setup(); swing(g, s); jump(g, s)
     assert start_state(g) == (PLATING, STOMPERS, BERSERKER, BOOSTERS) and g.moves == 4 and g.buffer_ == 700
+
+    # Do not restore before the original native input or simulation message.
+    for kind in (iron.MT_PLAYER_INPUT, iron.MT_TIME_PASSES):
+        g, s, _ = setup()
+        assert swing(g, s, send=False) == 0x1234
+        assert g.slots[iron.SLOT_BODY] == BERSERKER and g.events == [18]
+        s.sent(g.connection, 13)  # an acknowledgement is not the action
+        s.sent(g.connection + 1, kind)  # nor another connection's message
+        assert g.moves == 1 and len(s.deferred) == 1
+        native_action(g, s, kind)
+        assert g.events == [18, kind, 18] and g.slots[iron.SLOT_BODY] == PLATING
+        assert not s.deferred and not s.pending
+    # Both swaps in one input restore only after that one message.
+    g, s, _ = setup(); swing(g, s, send=False); jump(g, s, send=False)
+    assert g.slots[iron.SLOT_BODY] == BERSERKER and g.slots[iron.SLOT_MOB] == BOOSTERS
+    assert g.events == [18, 18] and len(s.deferred) == 2
+    native_action(g, s)
+    assert g.events == [18, 18, 14, 18, 18] and start_state(g) == (PLATING, STOMPERS, BERSERKER, BOOSTERS)
+    # Budget must reserve the first unpaid restore before starting the second.
+    g, s, _ = setup(); g.buffer_ = 299; swing(g, s, send=False); jump(g, s, send=False)
+    assert g.moves == 1 and g.calls[-1][0] == 'plain'
+    native_action(g, s); assert g.slots[iron.SLOT_BODY] == PLATING
+    g, s, _ = setup(); g.buffer_ = 375; swing(g, s, send=False); jump(g, s, send=False)
+    assert len(s.deferred) == 2
+    native_action(g, s); assert g.buffer_ == 75
+    # A world change with the same character pointer cancels old restores.
+    g, s, _ = setup(); swing(g, s, send=False); g.world += 1
+    native_action(g, s); assert g.moves == 1 and not s.deferred
+    # Refused simultaneous restores retain BOTH exact pairs for recovery.
+    g, s, _ = setup(); swing(g, s, send=False); jump(g, s, send=False); g.refuse = 2
+    native_action(g, s); assert len(s.pending) == 2
+    s.frame(); assert not s.pending and start_state(g) == (PLATING, STOMPERS, BERSERKER, BOOSTERS)
+    # If no normal action is emitted, the next frame restores instead.
+    g, s, logs = setup(); swing(g, s, send=False); s.frame()
+    assert g.slots[iron.SLOT_BODY] == PLATING and any('frame fallback' in m for m in logs)
+    # User-selected gear is never toggled during deferred restoration.
+    g, s, _ = setup(); swing(g, s, send=False); g.slots[iron.SLOT_BODY] = FILLER
+    native_action(g, s); assert g.moves == 1 and g.slots[iron.SLOT_BODY] == FILLER
+    # A transient restore exception keeps the plan until a later frame.
+    g, s, _ = setup(); swing(g, s, send=False)
+    real_move = g.move
+    def broken_move(frm, to):
+        raise RuntimeError('restore temporarily unavailable')
+    g.move = broken_move; native_action(g, s); assert len(s.pending) == 1
+    g.move = real_move; s.frame(); assert not s.pending and g.slots[iron.SLOT_BODY] == PLATING
 
     # Plugin._hook: a Python error never eats the game's own call, and never runs it twice.
     g, _, _ = setup()
@@ -280,6 +346,20 @@ def main():
     # The entry thunk: mov eax,[cb]; test; jz +5; pop edx; push ecx; push edx; jmp eax; jmp [orig]
     t = iron.entry_thunk(0x10000020, 0x10000024)
     assert t == bytes.fromhex('a120000010' '85c0' '7405' '5a5152' 'ffe0' 'ff2524000010'), t.hex()
+    # Sender callback forwards exactly once, before restoration, and never
+    # swallows the native message when restoration raises.
+    plugin.active = True
+    def restore_boom(connection, kind):
+        raise RuntimeError('restore')
+    plugin.swapper = NS(sent=restore_boom)
+    g.events = []; plugin.sent_hook(g.connection, 14, 0x123)
+    assert g.events == [14]
+    plugin.active = False; plugin.sent_hook(g.connection, 15, 0x456)
+    assert g.events == [14, 15]
+    patch = iron.sender_patch(0x10000000)
+    assert len(patch) == len(iron.SEND_MESSAGE_SIG) and patch[5:] == b'\x90' * 5
+    assert (iron.SEND_MESSAGE + 5 + int.from_bytes(patch[1:5], 'little')) & 0xffffffff == 0x10000000 + iron.SEND_AT
+    assert iron.SEND_CALL_THUNK == bytes.fromhex('5589e583e4f083ec088b4d088b450cff7514ff7510ffd089ec5dc3')
     print('ironclad swap logic tests passed')
 
 

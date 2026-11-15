@@ -16,12 +16,17 @@ jumps pass straight through untouched.
 > with the included test. It has not been run in the game on Windows yet, so
 > check the log lines below the first time you play.
 
+The action-order fix retains temporary gear until the game's original input
+or time message is sent, then immediately restores it. It has offline Windows
+logic and 32-bit x86 thunk coverage; this does not establish live Windows
+flight or official-server damage acceptance.
+
 ## Install
 
 1. Put `ironclad_swap.py` in the `plugins` folder of your SBPE install. That's
    the folder that also holds `pypy`, `manager.py` and `config.ini`.
 2. Add the section in `config-snippet.ini` to `config.ini`.
-3. Start StarBreak through SBPE.
+3. Restart StarBreak through SBPE after replacing the plugin.
 
 ## Setup in game
 
@@ -36,13 +41,14 @@ swap and the plugin does nothing.
 ## What you'll see
 
 Nothing. Your inventory shows your armor and Stompers the whole time. That's
-on purpose: each swap and its swap-back happen inside the same game call,
-before the screen is drawn. The SBPE log shows that it's working:
+on purpose: restoration runs immediately after the native action message,
+before the screen is drawn during normal processing. The SBPE log shows:
 
 ```
 ironclad_swap: on (Ironclad only; other characters untouched). ...
 ironclad_swap: swing #1 made in the Frenzied Berserker with Spiked Stompers on: damage bonus 90 (normally 30), ...
-ironclad_swap: boost #1 started in the Boosters; Spiked Stompers back on
+ironclad_swap: boost #1 started in the Boosters; Spiked Stompers restoration queued after native action
+ironclad_swap: worn gear restored after native action message
 ```
 
 It logs the first swing and boost, then every 25th one. Each swing line shows
@@ -57,8 +63,14 @@ pieces of machine code that call the plugin first:
 
 | Your action | Game function | What the plugin does |
 |---|---|---|
-| Hammer swing | `Hammer::doUse` | Equips the Berserker, lets the swing start, puts your armor back |
-| Jump in mid-air | `Item::doUse` on your plain boots | Equips the Boosters, starts the boost with them, puts your Stompers back |
+| Hammer swing | `Hammer::doUse` | Equips the Berserker, starts the swing, queues armor restoration after the native action message |
+| Jump in mid-air | `Item::doUse` on your plain boots | Equips the Boosters, starts the boost, queues Stompers restoration after the native action message |
+
+The Windows client predicts the action before sending MT14 (input) or MT15
+(time). Restoring inside `doUse` sent **equip → restore → action**. The sender
+hook now forwards the original message exactly once, then restores the gear:
+**equip → action → restore**. It does not create or rewrite input/time
+messages. Acknowledgements and unrelated connections cannot trigger a restore.
 
 Why that's enough (checked in the client's code):
 
@@ -82,7 +94,8 @@ DLL is needed.
 ## Safety checks
 
 - **Low input buffer:** the swap is skipped, and the swing or jump happens
-  normally, if your buffer is below 150 plus `buffer_reserve`.
+  normally, if your buffer is below 150 plus `buffer_reserve` and 75 for
+  each outstanding restoration. A simultaneous swing and boost reserve both.
 - **No wasted moves:** it only swaps when the game will actually swing or
   boost (the same "can act" check the game makes first), and only mid-air for
   boosts.
@@ -91,12 +104,17 @@ DLL is needed.
   removing that kind of item even briefly would cost health.
 - **Failed swap-back:** if putting your gear back is ever refused, it retries
   every frame until it succeeds. It stops retrying if you change the items
-  yourself.
+  yourself or the world/player/connection changes. If no action message is
+  emitted, the next frame restores the gear and logs that action ordering
+  was unverified.
 - **Python errors:** if the plugin hits an error, the game's own swing or jump
   still happens, exactly once, and the error goes to the log.
 - **Reloading:** SBPE can reload the plugin while the game runs. The reloaded
   copy takes over the same hooks; an unloaded copy sends every call straight
   back to the game.
+- **Sender compatibility:** the sender's original instructions are checked
+  before installing its trampoline. An unknown build or another plugin that
+  already owns that sender disables this plugin instead of overwriting it.
 
 ## Options (`[plugin_ironclad_swap]`)
 
@@ -134,10 +152,26 @@ moves cost 75 buffer and recalculate bonuses like the game does. It checks:
 - A refused swap-back gets retried.
 - A Python error still runs the game's own call exactly once.
 - The machine-code hook encodes the intended instructions.
+- Gear stays equipped through the original MT14/MT15 message, including a
+  simultaneous swing and boost; unrelated messages do not restore it.
+- Outstanding restores reserve their input budget and retain both exact item
+  pairs after refused moves or Python errors.
 
 ```
 python3 tests/test_ironclad_swap_logic.py
 ```
+
+Optional native thunk checks execute 32-bit x86 in an emulator without running
+StarBreak. With the development dependency `unicorn` installed:
+
+```
+python3 tests/test_windows_thunks.py --client /path/to/mvmmoclient.exe
+```
+
+This checks sender arguments, stack alignment/cleanup, preserved registers,
+callback and unloaded pass-through paths, the replayed native prologue, and
+the pinned Windows executable signatures. Omit `--client` for emulator-only
+checks.
 
 ## Fair use
 
