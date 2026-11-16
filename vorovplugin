@@ -1,0 +1,1222 @@
+import logging
+import time
+
+import cffi
+
+from _remote import ffi, lib
+from manager import PluginBase
+import util
+
+# One file, nothing else needed: drop it into SBPE's plugins folder. Steam
+# client only (it checks the client build and does nothing on any other).
+#
+# What you need in the inventory: the offense armor (Berserker) and one other
+# body armor, one worn and one carried. For the mobility swap, Stompers and
+# Boosters the same way.
+#
+# Every option in onInit can be set in config.ini under [plugin_armor_swap];
+# without that section the defaults here are used. The ones you may have to
+# change are the keys, they have to match your game keys:
+#   key_main, key_sec        main and secondary attack (D, S)
+#   key_warp                 the dash key (Shift), with
+#   key_warp_dirs            left/down/right for a duskwing warp (J K L)
+#   key_blast_dirs           up/left/down/right for a wildfire blast (I J K L)
+# To switch it on and off with a key, add to [plugin_keybinds]:
+#   armor_swap active toggle yes no = Keypad 7
+#   armor_swap mobility_active toggle yes no = Keypad 8
+#
+# Automatic body armor swap: wear the body armor with the most armor all the
+# time, and put the offense armor (Berserker) on only while attacking with no
+# hit about to land. A duskwing gets it for the instant a spin or warp starts:
+# the damage of an attack is fixed right then, see attackStart.
+#
+# The same plugin also swaps the mobility item: one on the ground (Stompers),
+# another in the air (Boosters). The air item goes on the moment the character
+# leaves the ground, jumping or falling, the ground item a moment after it
+# lands.
+#
+# A "hit" is predicted from what the client can see: enemy objects that deal
+# contact damage (bullets, the enemies themselves) are assumed to keep moving
+# the way they did over the last few frames, and active damage hitboxes count
+# where they are. Things that appear on top of the character, change direction
+# or home in are seen late or not at all.
+
+
+class modinv:
+    '''
+    Sends the game's own "move item" command, the one the inventory screen
+    sends when you equip something, without opening the inventory. It goes
+    through the game's own function, so it is paid for from the input
+    buffer like any other input.
+    '''
+    # WorldClient::handleModifyInv(const ModifyInv&) and
+    # ModifyInv::ModifyInv() in the steam client. the bytes at these
+    # addresses are checked before use, on any other build move() does
+    # nothing
+    HANDLE_MODIFY_INV = 0x4db870
+    HANDLE_MODIFY_INV_SIG = bytes.fromhex('5589e5565389ce83ec108b5d088b4948')
+    MODIFY_INV_CTOR = 0x53f670
+    MODIFY_INV_CTOR_SIG = bytes.fromhex('55c701')  # then the vtable address
+    MODINV_MOVE = 2
+    # what one command takes out of the input buffer
+    COST = 75
+    # cdecl -> thiscall with one argument: int thunk(this, function, arg)
+    THISCALL_THUNK = bytes.fromhex(
+        '5589e5'    # push ebp; mov ebp, esp
+        '83e4f0'    # and esp, -16
+        '83ec0c'    # sub esp, 12
+        '8b4d08'    # mov ecx, [ebp+8]
+        '8b450c'    # mov eax, [ebp+12]
+        'ff7510'    # push [ebp+16]
+        'ffd0'      # call eax
+        '89ec5dc3'  # mov esp, ebp; pop ebp; ret
+    )
+
+    wffi = cffi.FFI()
+    wffi.cdef('''
+void *__stdcall VirtualAlloc(void *addr, size_t size, uint32_t type, uint32_t protect);
+void *__stdcall GetCurrentProcess(void);
+int __stdcall ReadProcessMemory(void *proc, const void *addr, void *buf, size_t size, size_t *read);
+typedef int (*thiscall1)(void *self, void *fn, void *arg);
+''')
+
+    _state = None  # (thunk, vtable) once set up, False if unusable
+
+    @staticmethod
+    def _read(k32, addr, size):
+        w = modinv.wffi
+        buf = w.new('uint8_t[]', size)
+        ok = k32.ReadProcessMemory(
+            k32.GetCurrentProcess(), w.cast('void *', addr),
+            buf, size, w.NULL)
+        return bytes(w.buffer(buf)) if ok else None
+
+    @staticmethod
+    def ready():
+        if modinv._state is not None:
+            return bool(modinv._state)
+        modinv._state = False
+        w = modinv.wffi
+        k32 = w.dlopen('kernel32.dll')
+        if modinv._read(k32, modinv.HANDLE_MODIFY_INV, 16) != \
+                modinv.HANDLE_MODIFY_INV_SIG:
+            logging.error('armor_swap: unknown client build, not swapping')
+            return False
+        ctor = modinv._read(k32, modinv.MODIFY_INV_CTOR, 7)
+        if ctor is None or ctor[:3] != modinv.MODIFY_INV_CTOR_SIG:
+            logging.error('armor_swap: unknown client build, not swapping')
+            return False
+        # MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE
+        mem = k32.VirtualAlloc(w.NULL, 4096, 0x3000, 0x40)
+        if mem == w.NULL:
+            logging.error('armor_swap: VirtualAlloc failed, not swapping')
+            return False
+        w.memmove(mem, modinv.THISCALL_THUNK, len(modinv.THISCALL_THUNK))
+        modinv._state = (w.cast('thiscall1', mem),
+                         int.from_bytes(ctor[3:], 'little'))
+        return True
+
+    @staticmethod
+    def move(refs, slotpos, target):
+        '''move the item at slotpos to target, swapping with what is there'''
+        wc = refs.WorldClient
+        if not modinv.ready() or wc == ffi.NULL:
+            return False
+        w = modinv.wffi
+        thunk, vtable = modinv._state
+        # ModifyInv: classptr, command, slotpos, targetslotpos,
+        # _cached_size, _has_bits
+        msg = w.new('uint32_t[6]',
+                    [vtable, modinv.MODINV_MOVE, slotpos, target, 0, 7])
+        thunk(w.cast('void *', int(ffi.cast('uintptr_t', wc))),
+              w.cast('void *', modinv.HANDLE_MODIFY_INV), msg)
+        return True
+
+
+# settings that differ per shell unless config.ini says otherwise, see tune().
+# ironclad has to stand next to things to hit them, so it gets tight margins,
+# and its attacks need no time in the offense armor after they have started.
+# duskwing attacks are seen exactly, and its hits all land on the armor
+# anyway. a wildfire bullet gets its damage when it is fired, so no waiting
+# for it to land either
+SHELL_DEFAULTS = {
+    'ironclad': {'margin': 6, 'lead': 0.25, 'hold': 0.2, 'reserve': 250,
+                 'attack_linger': 0.15, 'shot_max': 0.3},
+    'duskwing': {'attack_linger': 0.0, 'low_hp': 0},
+    'wildfire': {'attack_linger': 0.15, 'shot_max': 0.0},
+}
+# the same for the mobility items: a fabricator wears Valenki on the ground
+SHELL_ITEMS = {
+    'fabricator': {'mobility_ground_item': 'Valenki'},
+}
+# attack inputs per shell, same: the duskwing whip gets no offense armor
+SHELL_INPUTS = {'duskwing': 'sec'}
+
+# The attack keys are read straight from windows. Asking SDL for them this
+# early means pumping its events, and that updates the keyboard state the
+# keybinds plugin compares before and after: its key presses got lost.
+winffi = cffi.FFI()
+winffi.cdef('short __stdcall GetAsyncKeyState(int vKey);')
+# virtual key codes of key names that are not a single letter or digit
+VK_NAMES = {
+    'space': 0x20, 'shift': 0x10, 'left shift': 0xa0, 'right shift': 0xa1,
+    'left ctrl': 0xa2, 'right ctrl': 0xa3, 'left alt': 0xa4,
+    'right alt': 0xa5, 'left': 0x25, 'up': 0x26, 'right': 0x27,
+    'down': 0x28, 'tab': 0x09, 'return': 0x0d,
+}
+
+SLOT_MAIN = 0x100
+SLOT_BODY = 0x400
+SLOT_MOB = 0x500
+# Properties.pose values that are not standing on anything (invalid, air)
+AIR_POSES = (0, 1)
+GROUND_POSE = 4  # this and above: stand, walk, run, crouch, hold, climb
+SLOT_INV = 0xf00
+# position units per pixel
+MP = 256
+# how far back the velocity of an object is measured, in seconds
+VEL_SPAN = 0.08
+# animation ids of the duskwing spin and warp, same lists as more_misc
+# (skein: 19, motley: 24, balefire: 29 / side warp: 10, exiting side warp: 11,
+# downwarp: 12, downwarp bounce: 13)
+SPIN_ANIM_IDS = (14, 19, 24, 29)
+WARP_ANIM_IDS = (10, 11, 12, 13)
+# a change in what the character carries this soon after a swap of ours is
+# that swap, in seconds
+OWN_SWAP = 0.5
+# actions whose start a duskwing gets the offense armor for
+START_ACTIONS = ('FlailSpinAction', 'DashAction', 'DashDownAction',
+                 'BombJumpAction')
+# held input bits (1 << ClientInput) that are attacks
+ATTACK_INPUTS = {'main': 1 << 5, 'sec': 1 << 6}
+# how long the character cannot be hurt again after a hit, in ms
+HIT_IFRAMES = 1500
+# AnimationData *WorldObject::animData(int *time) in the steam client, checked
+# against these bytes before use
+ANIM_DATA = 0x44e340
+ANIM_DATA_SIG = bytes.fromhex('5589e557565383ec3c89cb8b89d00000')
+# StatBoost.stat values that are armor
+ARMOR_STATS = (lib.STAT_ARMOR, lib.STAT_ITEMARMOR)
+# Properties.removetype bit of things a shield removes, as tested by
+# WorldObject::doShieldBoxes
+REMOVE_BY_SHIELD = 2
+
+
+def overlap(a, b):
+    '''do the boxes (x, y, w, h) overlap?'''
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and \
+        a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+
+
+def hitTime(a, b, vx, vy, horizon):
+    '''
+    when does box b, moving at (vx, vy) relative to box a, first overlap it?
+    boxes are (x, y, w, h). returns seconds from now, or None if not within
+    the horizon.
+    '''
+    enter, leave = 0.0, horizon
+    for amin, asize, bmin, bsize, v in ((a[0], a[2], b[0], b[2], vx),
+                                        (a[1], a[3], b[1], b[3], vy)):
+        amax, bmax = amin + asize, bmin + bsize
+        if v == 0:
+            if bmax <= amin or bmin >= amax:
+                return None
+            continue
+        t1 = (amin - bmax) / v
+        t2 = (amax - bmin) / v
+        if t1 > t2:
+            t1, t2 = t2, t1
+        enter = max(enter, t1)
+        leave = min(leave, t2)
+        if enter > leave:
+            return None
+    return enter
+
+
+class Plugin(PluginBase):
+    def onInit(self):
+        # on unless toggled off, see [plugin_keybinds]
+        self.config.option('active', True, 'bool')
+        # part of the name of the armor worn when nothing is coming
+        self.config.option('offense_item', 'Berserker')
+        # part of the name of the armor worn for hits, empty = whatever
+        # other body armor is in the inventory
+        self.config.option('defense_item', '')
+        # shells this works on
+        self.config.option('shells', 'Duskwing Wildfire Ironclad')
+        # put the defense armor on this long before a predicted hit, in
+        # seconds. has to cover your ping
+        self.config.option('lead', 0.5, 'float')
+        # keep it on this long after the last predicted hit
+        self.config.option('hold', 0.5, 'float')
+        # do not go back to offense while another hit is predicted within
+        # this time
+        self.config.option('horizon', 1.5, 'float')
+        # extra pixels around the character that count as a hit
+        self.config.option('margin', 16, 'int')
+        # ignore things that deal less than this
+        self.config.option('min_damage', 1, 'int')
+        # only go back to offense with at least this much input buffer left
+        # (a swap costs 75 of 1000)
+        self.config.option('reserve', 400, 'int')
+        # a crouching ironclad blocks bullets coming at its front, those
+        # do not count as hits
+        self.config.option('shield_block', True, 'bool')
+        # bullets that reach a fabricator platform before they reach the
+        # character do not count either
+        self.config.option('platform_block', True, 'bool')
+        # a duskwing gets the offense armor for the instant a spin or warp
+        # starts, and the defense armor back as soon as it has
+        self.config.option('spin_offense', True, 'bool')
+        # the warp keys: this one held together with any of the others
+        self.config.option('key_warp', 'Shift')
+        self.config.option('key_warp_dirs', 'J K L')
+        # the same for the blast of a wildfire, which also goes up. it is
+        # on the same dash inputs as the warp (BombJump::doUse)
+        self.config.option('blast_offense', True, 'bool')
+        self.config.option('key_blast_dirs', 'I J K L')
+        # give up on an attack that has not started after this long, in
+        # seconds, and go back to the defense armor
+        self.config.option('start_window', 0.1, 'float')
+        # no offense armor for a start when a hit is predicted this soon
+        self.config.option('start_block', 0.1, 'float')
+        # with the attack key held a spin follows the last one at once: the
+        # offense armor goes on this long before the running spin ends
+        self.config.option('respin_lead', 0.04, 'float')
+        # only with this much input buffer, the swap back has to fit too
+        self.config.option('start_buffer', 250, 'int')
+        # nothing can hurt for 1.5s after a hit: no danger during that.
+        # off: the character is stunned for that time anyway
+        self.config.option('use_iframes', False, 'bool')
+        # the duskwing spin is this long in ms, 0 = read it from the
+        # equipped weapon (see spinTime). only goes to the hit log now
+        self.config.option('spin_duration', 0, 'int')
+        # no longer used: the defense armor is on for the whole spin now
+        self.config.option('warp_duration', 450, 'int')
+        self.config.option('spin_end_lead', 0.1, 'float')
+        self.config.option('after_invuln', 0.25, 'float')
+        # lead, hold, horizon, margin, min_damage, reserve, attack_linger,
+        # shot_max, low_hp, high_hp and after_invuln can be set per shell by putting the shell's name
+        # in front: "ironclad_margin = 6", "duskwing_attack_linger = 0"
+        # shortest time between two swaps
+        self.config.option('min_interval', 0.05, 'float')
+        # held inputs that count as attacking (main, sec)
+        self.config.option('attack_inputs', 'main sec')
+        # keep the offense armor on until everything fired has landed or
+        # gone, but no longer than shot_max seconds after the last attack
+        self.config.option('wait_for_shots', True, 'bool')
+        self.config.option('shot_max', 3.0, 'float')
+        # the keys those are bound to in the game, same names as in
+        # [plugin_keybinds]. a press is seen here before the game handles
+        # it, so the swap goes out ahead of the attack it belongs to
+        self.config.option('key_main', 'D')
+        self.config.option('key_sec', 'S')
+        # still attacking this long after the last attack input or attack
+        # animation, so the armor does not flap between two swings
+        self.config.option('attack_linger', 0.4, 'float')
+        # also run in safe zones (eschaton, home), for testing on the dummy
+        self.config.option('in_safe_zones', False, 'bool')
+        # vids of harmless markers that become a damage source where they
+        # are going, separated by spaces
+        self.config.option('spawn_vids', 'scboss.summonsb')
+        # aiming lines of beams: harmless dots along the line (star
+        # cathedral tanks: sc.aim, ending in sc.aimend) and a beam fires
+        # along them about a second after they appear. it fires when their
+        # life left is down to beam_fire_left seconds (seen: 1.19 at the
+        # earliest), and is beam_size pixels wide
+        self.config.option('beam_vids', 'sc.aim sc.aimend')
+        self.config.option('beam_fire_left', 1.2, 'float')
+        self.config.option('beam_size', 16, 'int')
+        # under low_hp of the hitpoints (0.5 = half) the armor swap turns
+        # itself off and the defense armor stays on, until they are back
+        # up to high_hp. low_hp 0 = never. both can be set per shell
+        self.config.option('low_hp', 0.5, 'float')
+        self.config.option('high_hp', 0.65, 'float')
+        # mobility swap: its own switch, the two items by part of their
+        # names, and the shells it works on
+        self.config.option('mobility_active', True, 'bool')
+        self.config.option('mobility_ground_item', 'Stompers')
+        self.config.option('mobility_air_item', 'Boosters')
+        self.config.option('mobility_shells', 'Ironclad Fabricator')
+        # the ground item only goes on after standing this long, so a row
+        # of hops does not swap twice each
+        self.config.option('mobility_ground_delay', 0.15, 'float')
+        # anything that deals at least this much is an instant-kill floor:
+        # the mobility swap turns itself off in a room that has one
+        self.config.option('void_damage', 100000, 'int')
+        # status text, measured from the bottom right corner of the window
+        # (armor_track's two lines sit below it). size 0 hides it
+        self.config.option('right', 4, 'int')
+        self.config.option('bottom', 204, 'int')
+        self.config.option('size', 16, 'int')
+
+        self.user32 = winffi.dlopen('user32.dll')
+        self.txt = util.PlainText(size=self.config.size)
+        self.hist = {}        # objId -> [(time, x, y), ...]
+        self.markers = {}     # objId -> 'spawn', 'beam' or None
+        self.beamSeen = {}    # objId -> (first seen, life then) of aim dots
+        self.dangerUntil = 0  # wear defense until then
+        self.attackUntil = 0  # attacking until then
+        self.lastAttack = 0   # when an attack key or action was last seen
+        self.lastSec = 0      # when the secondary was last used
+        self.wasForced = False
+        self.forcedEnd = 0    # when the last spin or warp ended
+        self.lastSwap = 0     # when the last swap was sent
+        self.info = {}        # this frame's decision, for armor_track
+        self.nextSwap = 0     # no swap before then
+        self.sent = None      # (body item address before the swap, time)
+        self.shell = None
+        self.on = False
+        self.detail = ''      # what follows ON on the status line
+        self.txtLabel = util.PlainText(size=self.config.size)
+        self.txtLabel.text = 'Armor Swap:'
+        self.txtState = util.PlainText(size=self.config.size)
+        self.txtMobLabel = util.PlainText(size=self.config.size)
+        self.txtMobLabel.text = 'Mobility Swap:'
+        self.txtMobState = util.PlainText(size=self.config.size)
+        self.mobGround = None  # standing since then
+        self.mobNext = 0       # no mobility swap before then
+        self.mobSent = None    # (item address before the swap, time)
+        self.mobName = ''      # the mobility item that is on
+        self.hpLow = False     # hitpoints went under low_hp, not back up yet
+        self.spans = {}        # AnimationData address -> its hurt box spans
+        self.animOk = None     # can the hurt boxes be read on this build
+        self.animT = modinv.wffi.new('int *')
+        self.hurt = (0, 0, 0)  # untouchable seconds, animation time, length
+        self.hpOff = False     # we switched the armor swap off for that
+        self.prevMain = False  # attack key held last frame
+        self.prevMod = False   # warp key held last frame
+        self.prevDirs = frozenset()  # warp direction keys held last frame
+        self.prevIdle = False  # attack key held in the air with no action
+        self.lastAct = ((0, ''), None)  # last frame's action and spin time
+        self.respun = False    # the running spin already got its respin
+        self.startUntil = 0    # offense armor for a starting attack until
+        self.startWhat = ''
+        self.startFrom = ((0, ''), None)  # the action when that began
+        self.itemSig = None    # what the character carried last frame
+        self.mainKey = 0       # address of the main weapon it had
+        self.spinLen = 0       # how long that weapon spins in ms, 0 unknown
+        self.mobLast = 0       # when the last mobility swap was sent
+        self.room = 0          # address of the room we are in
+        self.roomSince = 0
+        self.voidRoom = False  # it has an instant-kill floor
+        self.voidScan = 0      # look for one again at this time
+        self.voidOff = False   # we switched the mobility swap off for it
+        self.forceAir = False  # the air item still has to go on
+        self.txtMob = util.PlainText(size=self.config.size)
+        self.classes = {}     # vtable address -> class name
+        self.attackActions = set(self.refs.CASTABLE.get('AttackAction', ()))
+        self.attackActions.add('AttackAction')
+
+    def tune(self, name):
+        '''a number setting, or its version for the current shell if the
+        config has one ("ironclad_margin" for "margin")'''
+        kind = self.config._schema[name][1]
+        shell = (self.shell or '').lower()
+        raw = self.config._section.get(
+            '{}_{}'.format(shell, name), '').strip()
+        if raw:
+            try:
+                return float(raw) if kind == 'float' else int(raw)
+            except ValueError:
+                pass
+        try:
+            return SHELL_DEFAULTS[shell][name]
+        except KeyError:
+            return getattr(self.config, name)
+
+    def shellItem(self, shell, name):
+        '''a mobility item name for this shell: "fabricator_mobility_ground_item"
+        in the config, else SHELL_ITEMS, else the general setting'''
+        raw = self.config._section.get(
+            '{}_{}'.format(shell, name), '').strip()
+        return (raw or SHELL_ITEMS.get(shell, {}).get(name) or
+                getattr(self.config, name)).lower()
+
+    def keyHeld(self, name):
+        '''is the key down right now? only while the game has the keyboard'''
+        name = name.strip().lower()
+        if len(name) == 1 and name.isalnum():
+            vk = ord(name.upper())
+        else:
+            vk = VK_NAMES.get(name, 0)
+        if vk == 0 or lib.SDL_GetKeyboardFocus() == ffi.NULL:
+            return False
+        return self.user32.GetAsyncKeyState(vk) & 0x8000 != 0
+
+    def items(self, pc):
+        '''slotpos -> Item* of everything the character carries.
+        PlayerCharacter.items: unordered_map<int, Item*>,
+        node = [next, key, Item*]'''
+        out = {}
+        ht = pc.items.t
+        node = ffi.cast('void **', ht.before_begin)
+        n = 0
+        while node != ffi.NULL and n < min(ht.element_count, 128):
+            if node[2] != ffi.NULL:
+                out[int(ffi.cast('uintptr_t', node[1])) & 0xffff] = \
+                    ffi.cast('struct Item *', node[2])
+            node = ffi.cast('void **', node[0])
+            n += 1
+        return out
+
+    def itemName(self, item):
+        if item is None or item.desc == ffi.NULL:
+            return ''
+        return util.getstr(item.desc.name)
+
+    def armor(self, item):
+        '''armor the item gives: its base stats plus its modifiers'''
+        total = item.itemArmor
+        for field in (item.desc.statboosts, item.itemProps.statboosts):
+            if field.current_size <= 0 or field.elements == ffi.NULL:
+                continue
+            boosts = ffi.cast('struct StatBoost **', field.elements)
+            for i in range(min(field.current_size, 64)):
+                if boosts[i].stat in ARMOR_STATS:
+                    total += boosts[i].val
+        return total
+
+    def spinTime(self, items):
+        '''
+        How long the equipped main weapon spins, in ms, 0 if it does not.
+        Flail::attack gives the spin the movetime of the first object in
+        the weapon's description plus the item's own moveTimeBoost, and
+        FlailSpinAction::update ends it when that has run down.
+        '''
+        main = items.get(SLOT_MAIN)
+        if main is None or main.desc == ffi.NULL or \
+                self.className(main) != 'Flail':
+            return 0
+        objs = main.desc.obj
+        if objs.current_size <= 0 or objs.elements == ffi.NULL:
+            return 0
+        first = ffi.cast('struct ItemObjDescription **', objs.elements)[0]
+        if first == ffi.NULL:
+            return 0
+        return max(first.movetime + main.moveTimeBoost, 0)
+
+    def watchItems(self, items, now):
+        '''
+        Read the spin time again whenever what the character carries has
+        changed, other than by a swap of ours. Our swaps never touch the
+        main weapon, so a new one always counts.
+        '''
+        sig = tuple(sorted(
+            (slot, int(ffi.cast('uintptr_t', it)),
+             int(ffi.cast('uintptr_t', it.desc)))
+            for slot, it in items.items()))
+        if sig == self.itemSig:
+            return
+        self.itemSig = sig
+        main = items.get(SLOT_MAIN)
+        mainKey = 0 if main is None else int(ffi.cast('uintptr_t', main))
+        ours = now - max(self.lastSwap, self.mobLast) < OWN_SWAP
+        if ours and mainKey == self.mainKey:
+            return
+        self.mainKey = mainKey
+        length = self.spinTime(items)
+        if length != self.spinLen:
+            self.spinLen = length
+            logging.info('armor_swap: "{}" spins for {} ms'.format(
+                self.itemName(main), length))
+
+    def attackStart(self, cw, now, soonest, spin, dirKeys, label):
+        '''
+        The damage of an attack is fixed when the attack is created
+        (Item::getDamageGenerator takes the character's damage bonus right
+        then), and so is that of whatever it leaves behind. The offense
+        armor does nothing for a spin or warp that is already running: it
+        has to be on in the frame the attack starts, and is not needed
+        after it.
+
+        The keys are read before the game handles them, so a swap sent now
+        is ahead of the attack a key press starts this frame. Returns 'spin'
+        or the label while the offense armor should be on for a start.
+
+        spin: also watch the attack key for spins (duskwing). dirKeys: the
+        keys that start the dash item (warp, blast) together with key_warp.
+        '''
+        cfg = self.config
+        wc = self.refs.WorldClient
+        typing = lib.SDL_IsTextInputActive() or wc.overlay != ffi.NULL
+        main = spin and not typing and self.keyHeld(cfg.key_main)
+        mod = not typing and self.keyHeld(cfg.key_warp)
+        dirs = frozenset(k for k in dirKeys.split()
+                         if mod and self.keyHeld(k))
+        pose = ffi.cast('struct WorldObject *', cw.player).props.pose
+        attached = ffi.cast('struct NativeObject *', cw.player).attached
+        air = pose in AIR_POSES or \
+            (attached.objId == 0 and pose < GROUND_POSE)
+        action = ffi.cast('struct ClientObject *', cw.player).action
+        cls = '' if action == ffi.NULL else self.className(action)
+        # what is left of a running spin, in ms (FlailSpinAction::update
+        # ends it at 0)
+        left = None
+        if cls == 'FlailSpinAction':
+            left = ffi.cast('struct FlailSpinAction *', action).moveTime
+            if not 0 <= left <= 5000:
+                left = None
+        cur = (int(ffi.cast('uintptr_t', action)), cls)
+        idle = main and air and action == ffi.NULL
+        if cur != self.lastAct[0] or (
+                left is not None and self.lastAct[1] is not None and
+                left > self.lastAct[1]):
+            self.respun = False
+
+        what = ''
+        if dirs and (dirs - self.prevDirs or not self.prevMod):
+            # a warp key combination went down
+            what = 'warp'
+        elif (main and air and not self.prevMain) or \
+                (idle and not self.prevIdle):
+            # the attack key went down in the air, or is held and the
+            # character has just become free to spin
+            what = 'spin'
+        elif main and left is not None and not self.respun and \
+                left <= cfg.respin_lead * 1000:
+            # held through a spin: the next one starts when this one ends
+            what = 'respin'
+            self.respun = True
+        self.prevMain, self.prevMod, self.prevDirs, self.prevIdle = \
+            main, mod, dirs, idle
+        self.lastAct = (cur, left)
+
+        if what and cw.inputBuffer >= cfg.start_buffer and not (
+                soonest is not None and soonest <= cfg.start_block):
+            self.startUntil = now + cfg.start_window
+            self.startWhat = what
+            self.startFrom = (cur, left)
+        elif now < self.startUntil:
+            # done as soon as the attack is there. after a respin, as soon
+            # as the old spin is gone, whatever follows
+            was, wasLeft = self.startFrom
+            new = cur != was or (left is not None and wasLeft is not None
+                                 and left > wasLeft)
+            if new and (cls in START_ACTIONS or self.startWhat == 'respin'):
+                self.startUntil = 0
+        if now >= self.startUntil:
+            return ''
+        return label if self.startWhat == 'warp' else 'spin'
+
+    def velocity(self, oid, now, x, y):
+        '''mp per second, from where the object was VEL_SPAN ago'''
+        h = self.hist.get(oid)
+        if h is None:
+            self.hist[oid] = [(now, x, y)]
+            return 0, 0
+        h.append((now, x, y))
+        while len(h) > 2 and h[1][0] <= now - VEL_SPAN:
+            h.pop(0)
+        t0, x0, y0 = h[0]
+        if now - t0 < 0.01:
+            return 0, 0
+        return (x - x0) / (now - t0), (y - y0) / (now - t0)
+
+    def className(self, obj):
+        vt = int(ffi.cast('uintptr_t', ffi.cast('void **', obj)[0]))
+        name = self.classes.get(vt)
+        if name is None:
+            name = self.classes[vt] = util.getClassName(obj)
+        return name
+
+    def platforms(self, cw):
+        '''boxes of every fabricator platform in the room'''
+        worlds = util.sVecMap2list(cw.clientSubWorlds,
+                                   'struct ForeignSubWorld *')
+        if cw.mySubWorld != ffi.NULL:
+            worlds.append(cw.mySubWorld.asNativeSubWorld)
+        out = []
+        for world in worlds:
+            for obj in util.worldobjects(world):
+                if 'CreatedPlatform' in self.className(obj):
+                    op = obj.props
+                    out.append((op.xmp, op.ymp, op.wmp, op.hmp))
+        return out
+
+    def shotsOut(self, cw):
+        '''is anything we fired still around? our own objects that expire
+        by themselves: thrown secondaries, bullets, their explosions'''
+        if cw.mySubWorld == ffi.NULL:
+            return False
+        me = ffi.cast('struct WorldObject *', cw.player)
+        for obj in util.worldobjects(cw.mySubWorld.asNativeSubWorld):
+            if obj != me and obj.props.lifetime > 0:
+                return True
+        return False
+
+    def soonestHit(self, cw, now):
+        '''seconds until the first predicted hit, None if nothing is coming'''
+        cfg = self.config
+        p = ffi.cast('struct WorldObject *', cw.player).props
+        m = self.tune('margin') * MP
+        horizon = self.tune('horizon')
+        minDamage = self.tune('min_damage')
+        me = (p.xmp - m, p.ymp - m, p.wmp + 2 * m, p.hmp + 2 * m)
+        mvx, mvy = self.velocity(0, now, p.xmp, p.ymp)
+
+        # the shield of a crouching ironclad covers its front. facing is an
+        # angle, 0 = right, 180 = left (WorldObject::facingRight)
+        shield = cfg.shield_block and self.shell == 'Ironclad' and \
+            ffi.cast('struct NativeObject *', cw.player).crouching
+        facing = p.facing % 360
+        right = facing < 90 or facing > 270
+        mid = p.xmp + p.wmp // 2
+        plats = self.platforms(cw) if cfg.platform_block else []
+
+        soonest = None
+        seen = set([0])
+        spawnVids = cfg.spawn_vids.split()
+        beamVids = cfg.beam_vids.split()
+        owners = {}  # objId -> velocity of things that hurt by hitbox
+        for obj in util.worldobjects(cw.serverSubWorld):
+            op = obj.props
+            oid = obj.objId
+            # harmless markers that turn into something that hurts where
+            # they are headed, like the green squids of the sc boss. the
+            # server sends where that is and how long it takes
+            # (squid_prediction.py draws the same thing)
+            kind = self.markers.get(oid, False)
+            if kind is False:
+                vid = util.getstr(op.vid)
+                kind = self.markers[oid] = 'spawn' if vid in spawnVids \
+                    else 'beam' if vid in beamVids else None
+            if kind == 'beam':
+                # a dot of a beam's aiming line: the beam comes along it
+                seen.add(oid)
+                first = self.beamSeen.get(oid)
+                if first is None:
+                    first = self.beamSeen[oid] = (now, op.lifetime)
+                fire = first[0] + max(first[1] / 1000 - cfg.beam_fire_left,
+                                      0)
+                t = max(fire - now, 0)
+                s = cfg.beam_size * MP
+                spot = (op.xmp + (op.wmp - s) // 2, op.ymp + (op.hmp - s) // 2,
+                        s, s)
+                then = (me[0] + mvx * t, me[1] + mvy * t, me[2], me[3])
+                if t <= horizon and \
+                        (overlap(me, spot) or overlap(then, spot)) and \
+                        (soonest is None or t < soonest):
+                    soonest = t
+                continue
+            marker = kind == 'spawn'
+            if marker and op.damage < minDamage:
+                seen.add(oid)
+                to = op.move.to if op.move != ffi.NULL else ffi.NULL
+                if to != ffi.NULL and to.dt >= 0:
+                    # in the way now, or by the time it gets there
+                    t = max(to.dt - to.pos, 0) / 1000
+                    spot = (to.xmp, to.ymp, op.wmp, op.hmp)
+                    then = (me[0] + mvx * t, me[1] + mvy * t, me[2], me[3])
+                    if t <= horizon and \
+                            (overlap(me, spot) or overlap(then, spot)) and \
+                            (soonest is None or t < soonest):
+                        soonest = t
+                continue
+            # once a marker has turned it hurts like anything else, whoever
+            # it says it belongs to
+            if not marker and op.ownertype != lib.OWNERTYPE_ENEMY:
+                continue
+            if op.damage < minDamage:
+                # hurts through its attack hitboxes only: those move with
+                # it, so remember how it is moving
+                if op.hitboxdamage >= minDamage:
+                    seen.add(oid)
+                    owners[oid] = self.velocity(oid, now, op.xmp, op.ymp)
+                continue
+            seen.add(oid)
+            vx, vy = self.velocity(oid, now, op.xmp, op.ymp)
+            box = (op.xmp, op.ymp, op.wmp, op.hmp)
+            t = hitTime(me, box, vx - mvx, vy - mvy, horizon)
+            if t is None or (soonest is not None and t >= soonest):
+                continue
+            if shield and op.removetype & REMOVE_BY_SHIELD and \
+                    (op.xmp + op.wmp // 2 > mid) == right:
+                continue
+            # a platform in the way gets it first
+            if any(hitTime(plat, box, vx, vy, t) is not None
+                   for plat in plats):
+                continue
+            soonest = t
+
+        # attack hitboxes are only there while they hurt. they travel with
+        # whatever they belong to (rolling spikes, a charging enemy)
+        boxes = util.vec2list(cw.activeHitboxes.hitboxes,
+                              'struct ActiveHitbox')
+        for box in boxes:
+            if box.damage < minDamage:
+                continue
+            r = box.rectmp
+            vx, vy = owners.get(box.objKey.objId, (0, 0))
+            t = hitTime(me, (r.x, r.y, r.w, r.h), vx - mvx, vy - mvy,
+                        horizon)
+            if t is not None and (soonest is None or t < soonest):
+                soonest = t
+
+        for oid in list(self.hist):
+            if oid not in seen:
+                del self.hist[oid]
+        for oid in list(self.beamSeen):
+            if oid not in seen:
+                del self.beamSeen[oid]
+        if len(self.markers) > 4096:
+            self.markers = {}
+        return soonest
+
+    def beforeUpdate(self):
+        # this runs before the game handles the frame's key events. a swap
+        # sent from here reaches the server ahead of an attack whose key
+        # went down this frame, so a thrown secondary already has the bonus
+        cfg = self.config
+        self.on = cfg.active
+        self.detail = ''
+        self.mobName = ''
+        # refs are from the previous frame otherwise
+        util.updateState()
+        cw = self.refs.ClientWorld
+        wc = self.refs.WorldClient
+        if cw == ffi.NULL or wc == ffi.NULL or cw.player == ffi.NULL:
+            return
+        # what is on is always shown, whether the swaps are running or not
+        worn = self.items(ffi.cast('struct PlayerCharacter *', cw.player))
+        wornBody = self.itemName(worn.get(SLOT_BODY))
+        self.detail = wornBody
+        self.mobName = self.itemName(worn.get(SLOT_MOB))
+        safe = cw.asWorld.props.safe and not cfg.in_safe_zones
+        shell = util.getClassName(cw.player)
+        if shell == 'Duskwing':
+            self.watchItems(worn, time.perf_counter())
+        if not safe and \
+                shell.lower() in cfg.mobility_shells.lower().split():
+            self.voidCheck(cw)
+            if cfg.mobility_active or self.forceAir:
+                self.mobility(cw)
+            if self.voidRoom:
+                self.mobName += '  (Void Room)'
+        if shell != self.shell:
+            self.shell = shell
+            logging.info('armor_swap: shell is "{}"'.format(shell))
+        armorShell = shell.lower() in cfg.shells.lower().split()
+        # low on hitpoints: no more risks, see hpGuard
+        lowHp = self.hpGuard(cw, armorShell)
+        self.on = cfg.active
+        if not cfg.active and not lowHp:
+            return
+        if safe:
+            self.detail = wornBody + '  (Safe Zone)'
+            return
+
+        # only the shells that can wear the offense armor
+        if not armorShell:
+            self.detail = '{}  (Not for {})'.format(wornBody, shell)
+            return
+
+        pc = ffi.cast('struct PlayerCharacter *', cw.player)
+        items = self.items(pc)
+        body = items.get(SLOT_BODY)
+        bodyName = self.itemName(body)
+        offense = cfg.offense_item.lower()
+        defense = cfg.defense_item.lower()
+        wearingOffense = offense in bodyName.lower()
+
+        # the armor to put on next, from the inventory: the offense armor,
+        # or for defense the body armor that gives the most armor
+        other = None
+        best = None
+        for slot in sorted(items):
+            if slot & 0xff00 != SLOT_INV:
+                continue
+            it = items[slot]
+            if it.desc == ffi.NULL or it.desc.slot != SLOT_BODY:
+                continue
+            name = self.itemName(it).lower()
+            if not wearingOffense:
+                if offense in name:
+                    other = slot
+                    break
+            elif offense not in name and defense in name:
+                a = self.armor(it)
+                if best is None or a > best:
+                    other, best = slot, a
+        if body is None or other is None:
+            self.detail = '{}  (Need {} + Another Body Armor)'.format(
+                wornBody, cfg.offense_item)
+            return
+
+        now = time.perf_counter()
+        soonest = self.soonestHit(cw, now)
+        if soonest is not None and soonest <= self.tune('lead'):
+            self.dangerUntil = now + self.tune('hold')
+
+        # a swap that did not change the body armor was refused by the game
+        if self.sent is not None:
+            if self.sent[0] == int(ffi.cast('uintptr_t', body)):
+                if now - self.sent[1] > 0.3:
+                    logging.error('armor_swap: the game refused the swap, '
+                                  'waiting 2s')
+                    self.nextSwap = now + 2
+                    self.sent = None
+            else:
+                self.sent = None
+
+        if lowHp:
+            # switched off for low hitpoints: the defense armor and nothing
+            # else
+            self.detail = bodyName + '  (Low HP)'
+            if wearingOffense and now >= self.nextSwap and \
+                    self.sent is None and cw.inputBuffer >= modinv.COST and \
+                    modinv.move(self.refs, other, SLOT_BODY):
+                self.sent = (int(ffi.cast('uintptr_t', body)), now)
+                self.lastSwap = now
+                self.nextSwap = now + cfg.min_interval
+            return
+
+        # a duskwing wears the offense armor for the instant a spin or warp
+        # starts, hits coming or not, and the defense armor for the rest
+        # of it: see attackStart
+        duskwing = shell == 'Duskwing'
+        untouch = self.untouchable(cw)
+        forced = ''
+        if cfg.spin_offense and duskwing:
+            forced = self.attackStart(cw, now, soonest, True,
+                                      cfg.key_warp_dirs, 'warp')
+        elif cfg.blast_offense and shell == 'Wildfire':
+            forced = self.attackStart(cw, now, soonest, False,
+                                      cfg.key_blast_dirs, 'blast')
+        if self.wasForced and not forced:
+            self.forcedEnd = now
+        self.wasForced = bool(forced)
+
+        # attacking: an attack key or input is held or an attack action is
+        # running
+        mask = 0
+        keyDown = False
+        typing = lib.SDL_IsTextInputActive() or wc.overlay != ffi.NULL
+        # which attacks count can differ per shell: "duskwing_attack_inputs
+        # = sec" leaves the whip out
+        inputs = (cfg._section.get(shell.lower() + '_attack_inputs', '') or
+                  SHELL_INPUTS.get(shell.lower()) or
+                  cfg.attack_inputs).lower().split()
+        for name in inputs:
+            mask |= ATTACK_INPUTS.get(name, 0)
+            key = getattr(cfg, 'key_' + name, '') if name in ATTACK_INPUTS \
+                else ''
+            if key and not typing and self.keyHeld(key):
+                keyDown = True
+                if name == 'sec':
+                    self.lastSec = now
+        if cw.total & ATTACK_INPUTS['sec'] & mask:
+            self.lastSec = now
+        action = ffi.cast('struct ClientObject *', cw.player).action
+        signal = False
+        # attack actions are main weapon attacks
+        if keyDown or cw.total & mask or (
+                'main' in inputs and action != ffi.NULL and
+                self.className(action) in self.attackActions):
+            self.attackUntil = now + self.tune('attack_linger')
+            self.lastAttack = now
+            signal = True
+        # the bonus has to still be on when a thrown secondary lands, so
+        # stay attacking while something of ours is in flight after one.
+        # only after a secondary: spins, warps and main weapons leave things
+        # behind too, and those kept the offense armor on between attacks
+        flying = cfg.wait_for_shots and \
+            now < self.lastSec + self.tune('shot_max') and \
+            self.shotsOut(cw)
+        # the frame of the attack itself counts whatever the linger: with a
+        # linger of 0 nothing ever would otherwise
+        attacking = signal or now < self.attackUntil or flying
+
+        # after a hit the character cannot be hurt again for a while
+        # (PlayerCharacter::canBeDamaged: lastDamageT + 1500ms of the
+        # sub world's clock). nothing is a danger until shortly before
+        # that runs out: the armor has to be back on by then
+        safe = False
+        if cfg.use_iframes:
+            last = ffi.cast('struct WorldObject *', cw.player).lastDamageT
+            since = ffi.cast('struct SubWorld *', cw.mySubWorld).t - last
+            safe = last != -1 and since >= 0 and \
+                (HIT_IFRAMES - since) / 1000 > self.tune('lead')
+        # the same while the animation has no hurt box, on any shell
+        safe = safe or untouch > self.tune('lead')
+
+        danger = now < self.dangerUntil and not safe
+        self.detail = '{}{}{}{}'.format(
+            bodyName,
+            '  ' + forced.capitalize() if forced else '  Shot Out' if flying
+            and now >= self.attackUntil else '  Attack' if attacking else '',
+            '  Safe' if safe else '',
+            '' if soonest is None else '  Hit in {:.2f}s'.format(soonest))
+
+        # defense is the default. offense for the start of a spin or warp,
+        # and while attacking as long as no hit is about to land
+        want = None
+        if forced or (attacking and not danger):
+            # outside the start of a spin or warp it is a bonus: leave the
+            # input buffer alone when it is low or the volta macro needs it
+            v = self.refs.manager._active.get('plugin_volta6')
+            spare = cw.inputBuffer >= self.tune('reserve') and \
+                (v is None or len(v.queue) == 0)
+            if not wearingOffense and (forced or spare):
+                want = 'offense'
+        elif wearingOffense:
+            want = 'defense'
+        self.info = {'forced': forced, 'attacking': attacking,
+                     'danger': danger, 'soonest': soonest, 'want': want,
+                     'buffer': cw.inputBuffer, 'lastSwap': self.lastSwap,
+                     'forcedEnd': self.forcedEnd, 'untouch': untouch,
+                     'spinLen': cfg.spin_duration or self.spinLen,
+                     'animT': self.hurt[1], 'animLen': self.hurt[2]}
+        if want is None or now < self.nextSwap or self.sent is not None or \
+                cw.inputBuffer < modinv.COST:
+            return
+
+        if modinv.move(self.refs, other, SLOT_BODY):
+            self.sent = (int(ffi.cast('uintptr_t', body)), now)
+            self.lastSwap = now
+            # going back and forth too fast only burns input buffer. not
+            # after the swap for a starting attack: the defense armor goes
+            # back on the moment the attack is there
+            self.nextSwap = now if forced and want == 'offense' \
+                else now + cfg.min_interval
+
+    def hurtSpans(self, data):
+        '''
+        The hurt boxes of an animation: [(from, to, untouchable), ...] in
+        animation time. AnimationData is {ganim, fullPose, length,
+        boxes[3], ...}, boxes[0] a vector of {time, length, rects} and rects
+        a vector holding one vector of {x, y, w, h}. A stretch whose boxes
+        all have no size cannot be hit: NativeObject::playerIsHit skips
+        them. That is what makes a spin or a warp invulnerable, for the
+        frames the animation says so.
+        '''
+        spans = self.spans.get(data)
+        if spans is not None:
+            return spans
+        spans = self.spans[data] = []
+        d = ffi.cast('int32_t *', data)
+        start, finish = d[3], d[4]
+        if start == 0 or finish <= start:
+            return spans
+        e = ffi.cast('int32_t *', start)
+        for i in range(min((finish - start) // 20, 64)):
+            t, length, rs, rf = e[i * 5], e[i * 5 + 1], e[i * 5 + 2], \
+                e[i * 5 + 3]
+            zero = False
+            if rs != 0 and rf - rs >= 12:
+                inner = ffi.cast('int32_t *', rs)
+                n = (inner[1] - inner[0]) // 16 if inner[0] != 0 else 0
+                if n > 0:
+                    r = ffi.cast('int32_t *', inner[0])
+                    zero = all(r[k * 4 + 2] == 0 and r[k * 4 + 3] == 0
+                               for k in range(min(n, 16)))
+            spans.append((t, t + length, zero))
+        return spans
+
+    def untouchable(self, cw):
+        '''seconds the current animation keeps the character from being
+        hit, 0 if it can be hit now'''
+        if self.animOk is None:
+            self.animOk = modinv.ready() and modinv._read(
+                modinv.wffi.dlopen('kernel32.dll'), ANIM_DATA, 16) == \
+                ANIM_DATA_SIG
+            if not self.animOk:
+                logging.error('armor_swap: unknown client build, cannot '
+                              'read hurt boxes')
+        if not self.animOk:
+            return 0
+        w = modinv.wffi
+        who = int(ffi.cast('uintptr_t', cw.player))
+        data = modinv._state[0](w.cast('void *', who),
+                                w.cast('void *', ANIM_DATA), self.animT)
+        data &= 0xffffffff
+        if data == 0:
+            return 0
+        t = self.animT[0]
+        length = ffi.cast('int32_t *', data)[2]
+        spans = self.hurtSpans(data)
+        # the game takes the first stretch that covers the time
+        cur = t
+        for _ in range(len(spans) + 1):
+            hit = next((s for s in spans if s[0] <= cur < s[1]), None)
+            if hit is None or not hit[2]:
+                break
+            cur = hit[1]
+        cur = min(cur, length)
+        if cur <= t:
+            self.hurt = (0, t, length)
+            return 0
+        # animation time to seconds: with animprops the animation runs
+        # over animprops.time
+        left = cur - t
+        ap = ffi.cast('struct WorldObject *', cw.player).props.animprops
+        if ap != ffi.NULL and ap.time > 0 and length > 0:
+            left = left * ap.time / length
+        self.hurt = (left / 1000, t, length)
+        return left / 1000
+
+    def hpGuard(self, cw, armorShell):
+        '''
+        Below low_hp of the hitpoints an unarmored hit is not worth the
+        risk: the armor swap turns itself off and the defense armor stays
+        on. It comes back on at high_hp. Switched back on by hand below
+        that, it stays on until the hitpoints have been up and come down
+        again. Returns whether it is holding the swap off right now.
+        '''
+        cfg = self.config
+        # nothing to guard on a shell the armor swap does not work on
+        low = self.tune('low_hp') if armorShell else 0
+        p = ffi.cast('struct WorldObject *', cw.player).props
+        frac = p.hitpoints / p.maxhitpoints if p.maxhitpoints > 0 else 1
+        if low <= 0 or frac >= self.tune('high_hp'):
+            self.hpLow = False
+            if self.hpOff:
+                self.hpOff = False
+                cfg.active = True
+        elif frac < low and not self.hpLow:
+            self.hpLow = True
+            if cfg.active:
+                cfg.active = False
+                self.hpOff = True
+        return self.hpOff and not cfg.active
+
+    def voidCheck(self, cw):
+        '''
+        A swap is never certain: it lands a frame and a ping after leaving
+        the ground, and not at all when the input buffer is empty or the
+        game refuses it. Over an instant-kill floor that is a death, so in a
+        room that has one the mobility swap turns itself off and leaves the
+        air item on. It can be switched back on for that room by hand, and
+        comes back by itself in the next room without one.
+        '''
+        cfg = self.config
+        now = time.perf_counter()
+        room = int(ffi.cast('uintptr_t', cw))
+        if room != self.room:
+            self.room = room
+            self.roomSince = now
+            self.voidRoom = False
+            self.voidScan = 0
+            self.forceAir = False
+            if self.voidOff:
+                self.voidOff = False
+                cfg.mobility_active = True
+        if self.voidRoom or now < self.voidScan:
+            return
+        # the floor arrives with the rest of the room, keep looking
+        self.voidScan = now + 0.25
+        for obj in util.worldobjects(cw.serverSubWorld):
+            if obj.props.damage >= cfg.void_damage:
+                self.voidRoom = True
+                self.forceAir = True
+                if cfg.mobility_active:
+                    cfg.mobility_active = False
+                    self.voidOff = True
+                logging.info('armor_swap: instant-kill floor in this room, '
+                             'mobility swap off')
+                return
+
+    def mobility(self, cw):
+        '''the air item off the ground, the ground item on it'''
+        cfg = self.config
+        now = time.perf_counter()
+        # on something: not in the air pose, and standing on an object or
+        # in a ground pose
+        pose = ffi.cast('struct WorldObject *', cw.player).props.pose
+        attached = ffi.cast('struct NativeObject *', cw.player).attached
+        grounded = pose not in AIR_POSES and \
+            (attached.objId != 0 or pose >= GROUND_POSE)
+        if not grounded:
+            self.mobGround = None
+        elif self.mobGround is None:
+            self.mobGround = now
+
+        items = self.items(ffi.cast('struct PlayerCharacter *', cw.player))
+        worn = items.get(SLOT_MOB)
+        self.mobName = self.itemName(worn)
+        shell = util.getClassName(cw.player).lower()
+        air = self.shellItem(shell, 'mobility_air_item')
+        if not cfg.mobility_active:
+            # switched off for a void room: the air item, once
+            want = air
+        elif grounded:
+            # not in the first moment of a room either, its floor may not
+            # have been seen yet
+            if now - self.mobGround < cfg.mobility_ground_delay or \
+                    now - self.roomSince < 1.0:
+                return
+            want = self.shellItem(shell, 'mobility_ground_item')
+        else:
+            want = air
+        if worn is None or want in self.itemName(worn).lower():
+            self.mobSent = None
+            self.forceAir = False
+            return
+
+        # a swap that did not change the item was refused by the game
+        if self.mobSent is not None:
+            if self.mobSent[0] != int(ffi.cast('uintptr_t', worn)):
+                self.mobSent = None
+            elif now - self.mobSent[1] > 0.3:
+                logging.error('armor_swap: the game refused the mobility '
+                              'swap, waiting 2s')
+                self.mobNext = now + 2
+                self.mobSent = None
+        if now < self.mobNext or self.mobSent is not None or \
+                cw.inputBuffer < modinv.COST:
+            return
+        # never while the volta macro is sending a volley: it needs nearly
+        # the whole input buffer, and its swaps have to land on time
+        v = self.refs.manager._active.get('plugin_volta6')
+        if v is not None and len(v.queue) > 0:
+            return
+
+        for slot in sorted(items):
+            it = items[slot]
+            if slot & 0xff00 == SLOT_INV and it.desc != ffi.NULL and \
+                    it.desc.slot == SLOT_MOB and \
+                    want in self.itemName(it).lower():
+                if modinv.move(self.refs, slot, SLOT_MOB):
+                    self.mobSent = (int(ffi.cast('uintptr_t', worn)), now)
+                    self.mobLast = now
+                    self.mobNext = now + cfg.min_interval
+                return
+
+    def onPresent(self):
+        # only in a world, not on the menus
+        size = self.config.size
+        if size <= 0 or self.refs.ClientWorld == ffi.NULL:
+            return
+        # two lines so the first never changes length: the label with ON
+        # or OFF in green or red, and under it the armor and what is going on
+        x = self.refs.windowW - self.config.right
+        y = self.refs.windowH - self.config.bottom
+        gap = size // 3
+        if self.detail:
+            self.txt.size = size
+            self.txt.text = self.detail
+            self.txt.draw(x, y, anchorX=1, anchorY=1)
+        y -= size + 4
+        self.txtState.size = size
+        self.txtState.text = 'ON' if self.on else 'OFF'
+        self.txtState.color = 0x40ff40 if self.on else 0xff4040
+        self.txtState.draw(x, y, anchorX=1, anchorY=1)
+        self.txtLabel.size = size
+        self.txtLabel.draw(x - self.txtState.w - gap, y,
+                           anchorX=1, anchorY=1)
+        # above that the mobility swap, laid out the same way: its switch
+        # and under it the item that is on
+        y -= size + 4
+        if self.mobName:
+            self.txtMob.size = size
+            self.txtMob.text = self.mobName
+            self.txtMob.draw(x, y, anchorX=1, anchorY=1)
+        y -= size + 4
+        mob = self.config.mobility_active
+        self.txtMobState.size = size
+        self.txtMobState.text = 'ON' if mob else 'OFF'
+        self.txtMobState.color = 0x40ff40 if mob else 0xff4040
+        self.txtMobState.draw(x, y, anchorX=1, anchorY=1)
+        self.txtMobLabel.size = size
+        self.txtMobLabel.draw(x - self.txtMobState.w - gap, y,
+                              anchorX=1, anchorY=1)
